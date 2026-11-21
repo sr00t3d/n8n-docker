@@ -28,6 +28,7 @@ NO_COLOR=0
 FORCE=0
 WORKERS=1
 DOMAIN_ARG=""
+PORT_ARG="5678"
 TIMEZONE_ARG="America/Sao_Paulo"
 BACKUP_DIR="${SCRIPT_DIR}/backups"
 
@@ -67,8 +68,8 @@ Usage:
 
 Actions:
   --init                     Generate .env with strong random secrets (chmod 600)
-  --status, --preflight      Audit runtime (Docker/Podman), .env security, port 5678 & containers
-  --up                       Start stack (PostgreSQL 16 + Redis 7 + n8n + workers)
+  --status, --preflight      Audit runtime (Docker/Podman), .env security, listen port & containers
+  --up                       Start stack (PostgreSQL 17 + Redis 7 + n8n + workers)
   --down                     Stop and remove stack containers (preserves volumes)
   --restart                  Restart stack services
   --update                   Pull latest images and recreate containers safely
@@ -77,9 +78,10 @@ Actions:
   --install-systemd          Install and enable portable n8n-docker.service unit (requires root)
 
 Options:
-  --domain <fqdn>            Domain for N8N_HOST / WEBHOOK_URL when running --init
+  --domain <fqdn>            Domain for N8N_HOST / N8N_WEBHOOK_URL when running --init
+  --port <port>              Host loopback listen port for --init (default: 5678)
   --tz <timezone>            Timezone for --init (default: America/Sao_Paulo)
-  --workers <N>              Number of n8n-worker replicas for --up/--update (default: 1)
+  --workers <N>              Number of n8n-worker replicas for --up/--update/--install-systemd (default: 1)
   --backup-dir <dir>         Custom backup output directory (default: ./backups)
   --force                    Overwrite existing .env on --init
   --dry-run                  Preview planned actions without modifying the system
@@ -173,10 +175,10 @@ action_init() {
 N8N_VERSION=stable
 N8N_HOST=${domain}
 N8N_PORT=5678
-N8N_LISTEN_PORT=5678
+N8N_LISTEN_PORT=${PORT_ARG}
 N8N_BIND_ADDR=127.0.0.1
 N8N_PROTOCOL=https
-WEBHOOK_URL=https://${domain}/
+N8N_WEBHOOK_URL=https://${domain}/
 N8N_ENCRYPTION_KEY=${enc_key}
 GENERIC_TIMEZONE=${TIMEZONE_ARG}
 TZ=${TIMEZONE_ARG}
@@ -196,16 +198,19 @@ EOF
 }
 
 action_status() {
-  local ram_mb disk_gb env_state="missing" env_perms="none" port_state="free" compose_valid="skipped"
+  local ram_mb disk_gb env_state="missing" env_perms="none" listen_port="5678" port_state="free" compose_valid="skipped"
   ram_mb="$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '0')"
   disk_gb="$(df -BG "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", $4); print $4}' || printf '0')"
 
   if [[ -f "$ENV_FILE" ]]; then
     env_state="present"
     env_perms="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || printf 'unknown')"
+    local env_port
+    env_port="$(awk -F= '/^N8N_LISTEN_PORT=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$ENV_FILE" 2>/dev/null || true)"
+    [[ -n "$env_port" ]] && listen_port="$env_port"
   fi
 
-  if command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | grep -qE ':5678[[:space:]]'; then
+  if command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | grep -qE ":${listen_port}[[:space:]]"; then
     port_state="in-use"
   fi
 
@@ -234,14 +239,15 @@ action_status() {
   "disk_free_gb": ${disk_gb:-0},
   "env_file": "$(json_escape "$env_state")",
   "env_perms": "$(json_escape "$env_perms")",
-  "port_5678": "$(json_escape "$port_state")"
+  "listen_port": ${listen_port},
+  "port_status": "$(json_escape "$port_state")"
 }
 EOF
       ;;
     csv)
-      printf 'os,runtime,compose_valid,ram_mb,disk_free_gb,env_file,env_perms,port_5678\n'
-      printf '"%s","%s","%s","%s","%s","%s","%s","%s"\n' \
-        "$OS_PRETTY" "$RUNTIME" "$compose_valid" "$ram_mb" "$disk_gb" "$env_state" "$env_perms" "$port_state"
+      printf 'os,runtime,compose_valid,ram_mb,disk_free_gb,env_file,env_perms,listen_port,port_status\n'
+      printf '"%s","%s","%s","%s","%s","%s","%s","%s","%s"\n' \
+        "$OS_PRETTY" "$RUNTIME" "$compose_valid" "$ram_mb" "$disk_gb" "$env_state" "$env_perms" "$listen_port" "$port_state"
       ;;
     table)
       if [[ "$QUIET" -eq 0 ]]; then
@@ -254,7 +260,7 @@ EOF
       printf '  Compose Config : %s\n' "$compose_valid"
       printf '  RAM / Disk Free: %s MB / %s GB\n' "$ram_mb" "$disk_gb"
       printf '  .env File      : %s (permissions: %s)\n' "$env_state" "$env_perms"
-      printf '  Port 5678      : %s\n' "$port_state"
+      printf '  Port %-10s: %s\n' "$listen_port" "$port_state"
       ;;
   esac
 }
@@ -311,12 +317,17 @@ action_backup() {
   local pg_user pg_db
   pg_user="$(awk -F= '/^POSTGRES_USER=/ {print $2; exit}' "$ENV_FILE")"
   pg_db="$(awk -F= '/^POSTGRES_DB=/ {print $2; exit}' "$ENV_FILE")"
-  (
+  if ! (
+    set -euo pipefail
     umask 077
     mkdir -p "$BACKUP_DIR"
-    run_compose exec -T postgres pg_dump -U "${pg_user:-postgres}" "${pg_db:-n8n}" | gzip -9 > "$outfile"
+    run_compose exec -T postgres pg_dump --clean --if-exists -U "${pg_user:-postgres}" "${pg_db:-n8n}" | gzip -9 > "$outfile"
     chmod 600 "$outfile"
-  )
+  ) || [[ ! -s "$outfile" ]]; then
+    rm -f "$outfile"
+    printf '%s PostgreSQL backup failed.\n' "$FAIL" >&2
+    exit 1
+  fi
   printf '%s Backup saved to %s (chmod 600).\n' "$OK" "$outfile"
 }
 
@@ -330,8 +341,8 @@ action_install_systemd() {
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%s [DRY-RUN] Would write %s (WorkingDirectory=%s, ExecStart=%s -f docker-compose.yml up -d)\n' \
-      "$ATT" "$unit_path" "$SCRIPT_DIR" "$exec_bin"
+    printf '%s [DRY-RUN] Would write %s (WorkingDirectory=%s, ExecStart=%s -f docker-compose.yml up -d --scale n8n-worker=%s)\n' \
+      "$ATT" "$unit_path" "$SCRIPT_DIR" "$exec_bin" "$WORKERS"
     return 0
   fi
 
@@ -350,7 +361,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${SCRIPT_DIR}
-ExecStart=${exec_bin} -f ${COMPOSE_FILE} up -d
+ExecStart=${exec_bin} -f ${COMPOSE_FILE} up -d --scale n8n-worker=${WORKERS}
 ExecStop=${exec_bin} -f ${COMPOSE_FILE} down
 TimeoutStartSec=0
 
@@ -380,6 +391,7 @@ main() {
       --backup)             ACTION="backup"; shift ;;
       --install-systemd)    ACTION="install-systemd"; shift ;;
       --domain)             DOMAIN_ARG="${2:-}"; shift 2 ;;
+      --port)               PORT_ARG="${2:-5678}"; shift 2 ;;
       --tz)                 TIMEZONE_ARG="${2:-America/Sao_Paulo}"; shift 2 ;;
       --workers)            WORKERS="${2:-1}"; shift 2 ;;
       --backup-dir)         BACKUP_DIR="${2:-$BACKUP_DIR}"; shift 2 ;;

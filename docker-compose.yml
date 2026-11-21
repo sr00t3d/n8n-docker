@@ -17,7 +17,6 @@ x-n8n-common: &n8n-common
     - QUEUE_BULL_REDIS_DB=${QUEUE_BULL_REDIS_DB:-0}
     - QUEUE_BULL_REDIS_PASSWORD=${REDIS_PASSWORD}
     - QUEUE_HEALTH_CHECK_ACTIVE=true
-    - N8N_RUNNERS_ENABLED=true
     - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
     - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
   volumes:
@@ -33,7 +32,7 @@ x-n8n-common: &n8n-common
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     restart: unless-stopped
     environment:
       - POSTGRES_DB=${POSTGRES_DB:-n8n}
@@ -59,7 +58,7 @@ services:
     volumes:
       - redis_storage:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -86,10 +85,11 @@ services:
       n8n:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz >/dev/null 2>&1 || exit 0"]
-      interval: 30s
+      test: ["CMD", "node", "/healthcheck.js"]
+      interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 30s
 
 volumes:
   db_storage:
